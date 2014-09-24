@@ -3,6 +3,8 @@ Platonic
 
 Example OpenGL/GLSL framework, and demo platonic solid renderer.
 
+![screenshot](https://github.com/gigadude/platonic/raw/master/platonic.png)
+
 This little demo shows off an extended GLSL parser (glslparser.yp)
 implemented with PERL Parse::Eyapp. The shader extensions allow
 you to specify all shaders in one file, using named vertexshader,
@@ -24,6 +26,7 @@ DEPENDENCIES
 * Linux
 * GL, GLU, freeglut
 * Parse::Lex, Parse::Eyapp
+
 The PERL modules can be installed with:
 
 ```bash
