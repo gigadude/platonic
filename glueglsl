@@ -1,0 +1,69 @@
+#!/usr/bin/env perl
+##
+## glueglsl - OpenGL Shading Language (glsl) glue utility to generate C++ headers from GLSL code
+##
+
+use glslparser;
+use strict;
+
+my $infile = '-';
+my $debug = undef;
+my $test_storable = undef;
+
+##
+## ShowUsage - show a help page
+##
+
+sub ShowUsage()
+{
+	print STDERR
+		"Usage: $0 [-d] [-h] [<file.glsl>]\n",
+		"-d = enable debugging output\n",
+		"-h = show this help page\n",
+		"<file.glsl> = shader file to process (defaults to stdin)\n";
+	exit( 0 );
+}
+
+##
+## parse command-line options
+##
+
+while (defined( my $arg = shift( @ARGV ) ))
+{
+	if ($arg =~ /^-(.*)$/)
+	{
+		my $opt = $1;
+		if ($opt eq 'd')
+		{
+			$debug = 1;
+		}
+		elsif ($opt eq 'ts')
+		{
+			$test_storable = 1;
+		}
+		else
+		{
+			ShowUsage();
+		}
+	}
+	else
+	{
+		ShowUsage() if ($infile ne '-') ;
+		$infile = $arg;
+	}
+}
+
+##
+## build the parse tree
+##
+
+my $sp = new glslparser;
+$sp->Parse( $infile, $debug );
+
+if ($sp->YYNberr() > 0)
+{
+	print $sp->YYNberr(), " errors detected, halting\n";
+	exit( 1 );
+}
+
+$sp->Build();

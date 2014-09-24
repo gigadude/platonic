@@ -1,0 +1,1382 @@
+##
+## glslparser.yp - grammar for OpenGL Shading Language and glue extensions
+##
+
+%{
+
+	use Parse::Lex;
+
+	##
+	## debug message handlers
+	##
+
+	sub _Dbug
+	{
+		print @_;
+	}
+
+	sub _Info
+	{
+		print @_;
+	}
+
+	sub _Stat
+	{
+		print @_;
+	}
+
+	sub _Warn
+	{
+		print STDERR @_;
+	}
+
+	sub _Fail
+	{
+		print STDERR @_;
+	}
+
+	##
+	## _Mark - mark a line and offset in the source text
+	##
+	
+	sub _Mark($$$)
+	{
+		my $sp = shift;
+		my $lexeme = shift;
+		my $startend = shift;
+
+		$sp->YYData->{MARK_OFFSET} = $lexeme->{POS}->[$startend];
+		$sp->YYData->{MARK_LINE} = $lexeme->{LINE}->[$startend];
+		#print "Mark line ", $sp->YYData->{MARK_LINE}, " @", $sp->YYData->{MARK_OFFSET}, "\n";
+	}
+	
+	##
+	## _Yank - yank text between last _Mark and current position
+	##
+
+	sub _Yank($$$)
+	{
+		my $sp = shift;
+		my $lexeme = shift;
+		my $startend = shift;
+
+		my $so = $sp->YYData->{MARK_OFFSET};
+		my $eo = $lexeme->{POS}->[$startend];
+		my $len = $eo - $so;
+		my $line = $sp->YYData->{MARK_LINE} - 1;
+		my $file = $sp->YYData->{FILE};
+		my $text = substr( $sp->YYData->{LINES}, $so, $len );
+		_Mark( $sp, $lexeme, $startend );
+		return '' if ($text =~ /^[\S\n]*$/) ;
+		return "#line $line \"$file\"\n$text\n";
+	}
+
+	##
+	## _MakeString - quote a C++-safe string
+	##
+	
+	sub _MakeString($)
+	{
+		my $s = shift;
+		$s =~ s/\"/\\\"/g;
+		$s =~ s/\n/\\n\"\n\"/g;
+		return $s;
+	}
+	
+	##
+	## _MergeLexemes - merge lexemes from the grammar productions
+	##
+
+	sub _MergeLexemes(@)
+	{
+		my (@prods) = (@_);
+		return $prods[1] if ($#prods == 1) ;
+		my $lexeme =
+		{
+			'TEXT' => $_[0]->YYName(),
+			'CHILD' => [],
+			'POS' => [ $prods[1]->{POS}->[0], $prods[$#prods]->{POS}->[1] ],
+			'LINE' => [ $prods[1]->{LINE}->[0], $prods[$#prods]->{LINE}->[1] ]
+		};
+		for (my $i = 1; $i <= $#prods; ++$i)
+		{
+			push( @{$lexeme->{CHILD}}, $prods[$i] );
+		}
+		return $lexeme;
+	}
+	
+	##
+	## _ParseDecl - parse part of a declaration statement
+	##
+	
+	sub _ParseDecl($$)
+	{
+		my $sp = shift;
+		my $lexeme = shift;
+
+		my $name = undef;
+		my $qt = undef;
+		my $asize = undef;
+
+		# HACK HACK HACK only handling the simplest cases for now...
+		if ($lexeme->{TEXT} =~ /^ID(_(UN)?SIZED_ARRAY)?/)
+		{
+			my $t = $lexeme->{CHILD}->[0];
+			if ($t->{TEXT} eq 'QUAL_TYPE_SPEC')
+			{
+				$name = $lexeme->{CHILD}->[1]->{TEXT};
+				$qt = { 'QUAL' => $t->{CHILD}->[0]->{TEXT}, 'TYPE' => $t->{CHILD}->[1]->{TEXT} };
+				if ($lexeme->{TEXT} =~ /^ID_UNSIZED_ARRAY/)
+				{
+					$asize = 0;
+				}
+				elsif ($lexeme->{TEXT} =~ /^ID_SIZED_ARRAY/)
+				{
+					$asize = $lexeme->{CHILD}->[3]->{TEXT};
+					#print "asize["; PrintTree( $lexeme->{CHILD}->[4], '' ); print "]\n";
+				}
+			}
+		}
+		elsif ($lexeme->{TEXT} =~ /^INIT_LIST_ID/)
+		{
+			$name = $lexeme->{CHILD}->[2]->{TEXT};
+			$qt = _ParseDecl( $sp, $lexeme->{CHILD}->[0] );
+			if ($lexeme->{TEXT} =~ /^INIT_LIST_ID_UNSIZED_ARRAY/)
+			{
+				$asize = 0;
+			}
+			elsif ($lexeme->{TEXT} =~ /^INIT_LIST_ID_SIZED_ARRAY/)
+			{
+				$asize = $lexeme->{CHILD}->[4]->{TEXT};
+				#print "asize["; PrintTree( $lexeme->{CHILD}->[4], '' ); print "]\n";
+			}
+		}
+		else
+		{
+			print "Unhandled decl:\n"; PrintTree( $lexeme, '' ); print "\n\n";
+		}
+
+		if (defined( $qt ))
+		{
+			my $scope = $sp->YYData->{DECL_SCOPE};
+			$sp->YYData->{DECLS}->{$scope}->{$name} =
+			{
+				'QUAL' => $qt->{QUAL},
+				'TYPE' => $qt->{TYPE},
+				'ASIZE' => $asize
+			};
+			#print "decl( $qt->{QUAL}, $qt->{TYPE}, $asize, $name )\n";
+		}
+		
+		return( $qt );
+	}
+
+	##
+	## _CollectDecls - examine a declaration and track in/varying/uniform types
+	##
+	
+	sub _CollectDecls($$)
+	{
+		my $sp = shift;
+		my $lexeme = shift;
+		my $scope = $sp->YYData->{DECL_SCOPE};
+
+		if ($lexeme->{TEXT} eq 'INIT')
+		{
+			$lexeme = $lexeme->{CHILD}->[0];
+			_ParseDecl( $sp, $lexeme );
+			#print "Decl:\n"; PrintTree( $lexeme, '' ); print "\n\n";
+		}
+		else
+		{
+			#print "Unhandled decl:\n"; PrintTree( $lexeme, '' ); print "\n\n";
+		}
+	}
+%}
+
+%defaultaction { &_MergeLexemes; }
+
+%%
+
+##
+## the spec is just a set of statements
+##
+
+effects: effects_opt 'EOI' { $_[0]->YYData->{TREE} = $_[1]; $_[0]->YYAccept(); } ;
+
+effects_opt:
+	/* empty */
+|	effect_translation_unit
+;
+
+variable_identifier:
+	IDENTIFIER
+;
+
+primary_expression:
+	variable_identifier
+|	INTCONSTANT
+|	UINTCONSTANT
+|	FLOATCONSTANT
+|	BOOLCONSTANT
+|	LEFT_PAREN expression RIGHT_PAREN
+;
+
+postfix_expression:
+	primary_expression
+|	postfix_expression LEFT_BRACKET integer_expression RIGHT_BRACKET
+|	function_call
+|	postfix_expression DOT field_selection
+|	postfix_expression INC_OP
+|	postfix_expression DEC_OP
+;
+
+integer_expression:
+	expression
+;
+
+function_call:
+	function_call_or_method
+;
+
+function_call_or_method:
+	function_call_generic
+|	postfix_expression DOT function_call_generic
+;
+
+function_call_generic:
+	function_call_header_with_parameters RIGHT_PAREN
+|	function_call_header_no_parameters RIGHT_PAREN
+;
+
+function_call_header_no_parameters:
+	function_call_header VOID
+|	function_call_header
+;
+
+function_call_header_with_parameters:
+	function_call_header assignment_expression
+|	function_call_header_with_parameters COMMA assignment_expression
+;
+
+function_call_header:
+	function_identifier LEFT_PAREN
+;
+
+# Grammar Note: Constructors look like functions, but lexical analysis recognized most of them as
+# keywords. They are now recognized through “type_specifier”.
+
+function_identifier:
+	type_specifier
+|	IDENTIFIER
+|	field_selection
+;
+
+field_selection:
+	IDENTIFIER
+;
+
+unary_expression:
+	postfix_expression
+|	INC_OP unary_expression
+|	DEC_OP unary_expression
+|	unary_operator unary_expression
+;
+
+# Grammar Note: No traditional style type casts.
+
+unary_operator:
+	PLUS
+|	DASH
+|	BANG
+|	TILDE
+;
+
+# Grammar Note: No '*' or '&' unary ops. Pointers are not supported.
+
+multiplicative_expression:
+	unary_expression
+|	multiplicative_expression STAR unary_expression
+|	multiplicative_expression SLASH unary_expression
+|	multiplicative_expression PERCENT unary_expression
+;
+
+additive_expression:
+	multiplicative_expression
+|	additive_expression PLUS multiplicative_expression
+|	additive_expression DASH multiplicative_expression
+;
+
+shift_expression:
+	additive_expression
+|	shift_expression LEFT_OP additive_expression
+|	shift_expression RIGHT_OP additive_expression
+;
+
+relational_expression:
+	shift_expression
+|	relational_expression LEFT_ANGLE shift_expression
+|	relational_expression RIGHT_ANGLE shift_expression
+|	relational_expression LE_OP shift_expression
+|	relational_expression GE_OP shift_expression
+;
+
+equality_expression:
+	relational_expression
+|	equality_expression EQ_OP relational_expression
+|	equality_expression NE_OP relational_expression
+;
+
+and_expression:
+	equality_expression
+|	and_expression AMPERSAND equality_expression
+;
+
+exclusive_or_expression:
+	and_expression
+|	exclusive_or_expression CARET and_expression
+;
+
+inclusive_or_expression:
+	exclusive_or_expression
+|	inclusive_or_expression VERTICAL_BAR exclusive_or_expression
+;
+
+logical_and_expression:
+	inclusive_or_expression
+|	logical_and_expression AND_OP inclusive_or_expression
+;
+
+logical_xor_expression:
+	logical_and_expression
+|	logical_xor_expression XOR_OP logical_and_expression
+;
+
+logical_or_expression:
+	logical_xor_expression
+|	logical_or_expression OR_OP logical_xor_expression
+;
+
+conditional_expression:
+	logical_or_expression
+|	logical_or_expression QUESTION expression COLON assignment_expression
+;
+
+assignment_expression:
+	conditional_expression
+|	unary_expression assignment_operator assignment_expression
+;
+
+assignment_operator:
+	EQUAL
+|	MUL_ASSIGN
+|	DIV_ASSIGN
+|	MOD_ASSIGN
+|	ADD_ASSIGN
+|	SUB_ASSIGN
+|	LEFT_ASSIGN
+|	RIGHT_ASSIGN
+|	AND_ASSIGN
+|	XOR_ASSIGN
+|	OR_ASSIGN
+;
+
+expression:
+	assignment_expression
+|	expression COMMA assignment_expression
+;
+
+constant_expression:
+	conditional_expression
+;
+
+declaration:
+	%name FUNC function_prototype SEMICOLON
+|	%name INIT init_declarator_list SEMICOLON
+|	%name PREC PRECISION precision_qualifier type_specifier_no_prec SEMICOLON
+|	%name ANON_IFACE type_qualifier IDENTIFIER LEFT_BRACE struct_declaration_list RIGHT_BRACE SEMICOLON
+|	%name IFACE type_qualifier IDENTIFIER LEFT_BRACE struct_declaration_list RIGHT_BRACE IDENTIFIER SEMICOLON
+|	%name ANON_IFACE_UNSIZED_ARRAY type_qualifier IDENTIFIER LEFT_BRACE struct_declaration_list RIGHT_BRACE IDENTIFIER LEFT_BRACKET RIGHT_BRACKET SEMICOLON
+|	%name ANON_IFACE_SIZED_ARRAY type_qualifier IDENTIFIER LEFT_BRACE struct_declaration_list RIGHT_BRACE IDENTIFIER LEFT_BRACKET constant_expression RIGHT_BRACKET SEMICOLON
+|	%name DECL type_qualifier SEMICOLON
+;
+
+function_prototype:
+	function_declarator RIGHT_PAREN
+;
+
+function_declarator:
+	function_header
+|	function_header_with_parameters
+;
+
+function_header_with_parameters:
+	function_header parameter_declaration
+|	function_header_with_parameters COMMA parameter_declaration
+;
+
+function_header:
+	fully_specified_type IDENTIFIER LEFT_PAREN
+;
+
+parameter_declarator:
+	type_specifier IDENTIFIER
+|	type_specifier IDENTIFIER LEFT_BRACKET constant_expression RIGHT_BRACKET
+;
+
+parameter_declaration:
+	parameter_type_qualifier parameter_qualifier parameter_declarator
+|	parameter_type_qualifier parameter_qualifier parameter_type_specifier
+|	parameter_qualifier parameter_declarator
+|	parameter_qualifier parameter_type_specifier
+;
+
+parameter_qualifier:
+	/* empty */
+|	IN
+|	OUT
+|	INOUT
+;
+
+parameter_type_specifier:
+	type_specifier
+;
+
+init_declarator_list:
+	single_declaration
+|	%name INIT_LIST_ID init_declarator_list COMMA IDENTIFIER
+|	%name INIT_LIST_ID_UNSIZED_ARRAY init_declarator_list COMMA IDENTIFIER LEFT_BRACKET RIGHT_BRACKET
+|	%name INIT_LIST_ID_SIZED_ARRAY init_declarator_list COMMA IDENTIFIER LEFT_BRACKET constant_expression RIGHT_BRACKET
+|	%name INIT_LIST_ID_UNSIZED_ARRAY_INIT init_declarator_list COMMA IDENTIFIER LEFT_BRACKET RIGHT_BRACKET EQUAL initializer
+|	%name INIT_LIST_ID_SIZED_ARRAY_INIT init_declarator_list COMMA IDENTIFIER LEFT_BRACKET constant_expression RIGHT_BRACKET EQUAL initializer
+|	%name INIT_LIST_ID_INIT init_declarator_list COMMA IDENTIFIER EQUAL initializer
+;
+
+single_declaration:
+	%name TYPE fully_specified_type
+|	%name ID fully_specified_type IDENTIFIER
+|	%name ID_UNSIZED_ARRAY fully_specified_type IDENTIFIER LEFT_BRACKET RIGHT_BRACKET
+|	%name ID_SIZED_ARRAY fully_specified_type IDENTIFIER LEFT_BRACKET constant_expression RIGHT_BRACKET
+|	%name ID_UNSIZED_ARRAY_INIT fully_specified_type IDENTIFIER LEFT_BRACKET RIGHT_BRACKET EQUAL initializer
+|	%name ID_SIZED_ARRAY_INIT fully_specified_type IDENTIFIER LEFT_BRACKET constant_expression RIGHT_BRACKET EQUAL initializer
+|	%name ID_INIT fully_specified_type IDENTIFIER EQUAL initializer
+|	%name INVARIANT_ID INVARIANT IDENTIFIER
+;
+
+# Grammar Note: No 'enum', or 'typedef'.
+
+fully_specified_type:
+	%name TYPE_SPEC type_specifier
+|	%name QUAL_TYPE_SPEC type_qualifier type_specifier
+;
+
+invariant_qualifier:
+	%name INVARIANT INVARIANT
+;
+
+interpolation_qualifier:
+	SMOOTH
+|	FLAT
+|	NOPERSPECTIVE
+;
+
+layout_qualifier:
+	LAYOUT LEFT_PAREN layout_qualifier_id_list RIGHT_PAREN
+;
+
+layout_qualifier_id_list:
+	layout_qualifier_id
+|	layout_qualifier_id_list COMMA layout_qualifier_id
+;
+
+layout_qualifier_id:
+	IDENTIFIER
+|	IDENTIFIER EQUAL INTCONSTANT
+;
+
+parameter_type_qualifier:
+	CONST
+;
+
+type_qualifier:
+	%name QUAL_STORAGE storage_qualifier
+|	%name QUAL_LAYOUT layout_qualifier
+|	%name QUAL_LAYOUT_STORAGE layout_qualifier storage_qualifier
+|	%name QUAL_INTERP_STORAGE interpolation_qualifier storage_qualifier
+|	%name QUAL_INTERP interpolation_qualifier
+|	%name QUAL_INVARIANT_STORAGE invariant_qualifier storage_qualifier
+|	%name QUAL_INVARIANT_INTERP_STORAGE invariant_qualifier interpolation_qualifier storage_qualifier
+|	%name QUAL_INVARIANT invariant
+;
+
+storage_qualifier:
+	CONST
+|	ATTRIBUTE
+|	VARYING
+|	CENTROID VARYING
+|	IN
+|	OUT
+|	CENTROID IN
+|	CENTROID OUT
+|	UNIFORM
+;
+
+type_specifier:
+	type_specifier_no_prec
+|	precision_qualifier type_specifier_no_prec
+;
+
+type_specifier_no_prec:
+	%name TYPE_SPEC type_specifier_nonarray
+|	%name TYPE_SPEC_UNSIZED_ARRAY type_specifier_nonarray LEFT_BRACKET RIGHT_BRACKET
+|	%name TYPE_SPEC_SIZED_ARRAY type_specifier_nonarray LEFT_BRACKET constant_expression RIGHT_BRACKET
+;
+
+type_specifier_nonarray:
+	VOID
+|	FLOAT
+|	INT
+|	UINT
+|	BOOL
+|	VEC2
+|	VEC3
+|	VEC4
+|	BVEC2
+|	BVEC3
+|	BVEC4
+|	IVEC2
+|	IVEC3
+|	IVEC4
+|	UVEC2
+|	UVEC3
+|	UVEC4
+|	MAT2
+|	MAT3
+|	MAT4
+|	MAT2X2
+|	MAT2X3
+|	MAT2X4
+|	MAT3X2
+|	MAT3X3
+|	MAT3X4
+|	MAT4X2
+|	MAT4X3
+|	MAT4X4
+|	SAMPLER1D
+|	SAMPLER2D
+|	SAMPLER3D
+|	SAMPLERCUBE
+|	SAMPLER1DSHADOW
+|	SAMPLER2DSHADOW
+|	SAMPLERCUBESHADOW
+|	SAMPLER1DARRAY
+|	SAMPLER2DARRAY
+|	SAMPLER1DARRAYSHADOW
+|	SAMPLER2DARRAYSHADOW
+|	ISAMPLER1D
+|	ISAMPLER2D
+|	ISAMPLER3D
+|	ISAMPLERCUBE
+|	ISAMPLER1DARRAY
+|	ISAMPLER2DARRAY
+|	USAMPLER1D
+|	USAMPLER2D
+|	USAMPLER3D
+|	USAMPLERCUBE
+|	USAMPLER1DARRAY
+|	USAMPLER2DARRAY
+|	SAMPLER2DRECT
+|	SAMPLER2DRECTSHADOW
+|	ISAMPLER2DRECT
+|	USAMPLER2DRECT
+|	SAMPLERBUFFER
+|	ISAMPLERBUFFER
+|	USAMPLERBUFFER
+|	SAMPLER2DMS
+|	ISAMPLER2DMS
+|	USAMPLER2DMS
+|	SAMPLER2DMSARRAY
+|	ISAMPLER2DMSARRAY
+|	USAMPLER2DMSARRAY
+|	struct_specifier
+|	type_name
+;
+
+# TYPE_NAME should perform a semantic check on the validity of IDENTIFIER
+
+type_name:
+	IDENTIFIER
+;
+
+precision_qualifier:
+	HIGH_PRECISION
+|	MEDIUM_PRECISION
+|	LOW_PRECISION
+;
+
+struct_specifier:
+	STRUCT IDENTIFIER LEFT_BRACE struct_declaration_list RIGHT_BRACE
+|	STRUCT LEFT_BRACE struct_declaration_list RIGHT_BRACE
+;
+
+struct_declaration_list:
+	struct_declaration
+|	struct_declaration_list struct_declaration
+;
+
+struct_declaration:
+	type_specifier struct_declarator_list SEMICOLON
+|	type_qualifier type_specifier struct_declarator_list SEMICOLON
+;
+
+struct_declarator_list:
+	struct_declarator
+|	struct_declarator_list COMMA struct_declarator
+;
+
+struct_declarator:
+	IDENTIFIER
+|	IDENTIFIER LEFT_BRACKET RIGHT_BRACKET
+|	IDENTIFIER LEFT_BRACKET constant_expression RIGHT_BRACKET
+;
+
+initializer:
+	assignment_expression
+;
+
+declaration_statement:
+	declaration
+;
+
+statement:
+	compound_statement
+|	simple_statement
+;
+
+# Grammar Note: labeled statements for SWITCH only; 'goto' is not supported.
+
+simple_statement:
+	expression_statement
+|	declaration_statement
+|	selection_statement
+|	switch_statement
+|	case_label
+|	iteration_statement
+|	jump_statement
+;
+
+compound_statement:
+	LEFT_BRACE RIGHT_BRACE
+|	LEFT_BRACE statement_list RIGHT_BRACE
+;
+
+statement_no_new_scope:
+	compound_statement_no_new_scope
+|	simple_statement
+;
+
+compound_statement_no_new_scope:
+	LEFT_BRACE RIGHT_BRACE
+|	LEFT_BRACE statement_list RIGHT_BRACE
+;
+
+statement_list:
+	statement
+|	statement_list statement
+;
+
+expression_statement:
+	SEMICOLON
+|	expression SEMICOLON
+;
+
+selection_statement:
+	IF LEFT_PAREN expression RIGHT_PAREN selection_rest_statement
+;
+
+selection_rest_statement:
+	statement ELSE statement
+|	statement
+;
+
+condition:
+	expression
+|	fully_specified_type IDENTIFIER EQUAL initializer
+;
+
+switch_statement:
+	SWITCH LEFT_PAREN expression RIGHT_PAREN LEFT_BRACE switch_statement_list RIGHT_BRACE
+;
+
+switch_statement_list:
+	/* empty */
+|	statement_list
+;
+
+case_label:
+	CASE expression COLON
+|	DEFAULT COLON
+;
+
+iteration_statement:
+	WHILE LEFT_PAREN condition RIGHT_PAREN statement_no_new_scope
+|	DO statement WHILE LEFT_PAREN expression RIGHT_PAREN SEMICOLON
+|	FOR LEFT_PAREN for_init_statement for_rest_statement RIGHT_PAREN
+|	statement_no_new_scope
+;
+
+for_init_statement:
+	expression_statement
+|	declaration_statement
+;
+
+conditionopt:
+	/* empty */
+|	condition
+;
+
+for_rest_statement:
+	conditionopt SEMICOLON
+|	conditionopt SEMICOLON expression
+;
+
+jump_statement:
+	CONTINUE SEMICOLON
+|	BREAK SEMICOLON
+|	RETURN SEMICOLON
+|	RETURN expression SEMICOLON
+|	DISCARD SEMICOLON
+;
+
+# Grammar Note: No 'goto'. Gotos are not supported.
+
+translation_unit:
+	external_declaration
+|	translation_unit external_declaration
+;
+
+external_declaration:
+	function_definition
+|	declaration
+	{
+		_CollectDecls( $_[0], $_[1] );
+		&_MergeLexemes;
+	}
+;
+
+function_definition:
+	function_prototype compound_statement_no_new_scope
+;
+
+effect_translation_unit:
+	effect_external_declaration
+|	effect_translation_unit effect_external_declaration
+;
+
+effect_external_declaration:
+	external_declaration
+|	shader_definition
+|	program_definition
+;
+
+shader_definition:
+	shader_type IDENTIFIER LEFT_BRACE
+	{
+		$_[0]->YYData->{GLOBAL_DECLS} .= _Yank( $_[0], $_[1], 0 );
+		_Mark( $_[0], $_[3], 1 );
+		# create a new scope for the shader
+		$_[0]->YYData->{DECL_SCOPE} = $_[1]->{TEXT};
+		$_[0]->YYData->{DECLS}->{$_[0]->YYData->{DECL_SCOPE}} = {};
+	}
+	translation_unit
+	{
+		my $type = $_[1]->{TEXT};
+		my $name = $_[2]->{TEXT};
+		my $globals = $_[0]->YYData->{GLOBAL_DECLS};
+		my $shader = _Yank( $_[0], $_[5], 1 );
+		if (exists( $_[0]->YYData->{$type}->{$name} ))
+		{
+			_Warn( "Duplicate $type $name declared!\n" );
+		}
+		$_[0]->YYData->{$type}->{$name} =
+		{
+			'TEXT' => _MakeString( "$globals\n$shader" ),
+			# merge the global then local scopes
+			'DECLS' => { ( %{$_[0]->YYData->{DECLS}->{''}}, %{$_[0]->YYData->{DECLS}->{$type}} ) }
+		};
+		#print "$type $name GLOBALS:\n", join( "\n", ( %{$_[0]->YYData->{DECLS}->{''}} ) ), "\n\n";
+		#print "$type $name LOCALS:\n", join( "\n", ( %{$_[0]->YYData->{DECLS}->{$type}} ) ), "\n\n";
+		#print "$type $name MERGED:\n", join( "\n", ( %{$_[0]->YYData->{$type}->{$name}->{DECLS}} ) ), "\n\n";
+		#print "Parsed $type ($name):\nglobals:\n$globals\nshader:\n$shader\n<><><><><><><><><><><><>\n";
+	}
+	RIGHT_BRACE
+	{
+		_Mark( $_[0], $_[7], 1 );
+		$_[0]->YYData->{DECL_SCOPE} = '';
+		&_MergeLexemes;
+	}
+;
+
+shader_type:
+	VERTEXSHADER
+|	GEOMETRYSHADER
+|	FRAGMENTSHADER
+;
+
+program_definition:
+	PROGRAM IDENTIFIER LEFT_BRACE
+	{
+		my $name = $_[2]->{TEXT};
+		$_[0]->YYData->{PROGRAM_SCOPE} = $name;
+		$_[0]->YYData->{PROGRAM}->{$name} = {};
+	}
+	program_shader_list RIGHT_BRACE
+	{
+		$_[0]->YYData->{PROGRAM_SCOPE} = undef;
+		&_MergeLexemes;
+	}
+;
+
+program_shader_list:
+	program_shader
+|	program_shader_list program_shader
+;
+
+program_shader:
+	shader_type IDENTIFIER SEMICOLON
+	{
+		my $type = $_[1]->{TEXT};
+		my $shader = $_[2]->{TEXT};
+		my $name = $_[0]->YYData->{PROGRAM_SCOPE};
+		if (exists( $_[0]->YYData->{PROGRAM}->{$name}->{$type} ))
+		{
+			_Warn( "Duplicate shader binding $shader in program $name\n" );
+		}
+		$_[0]->YYData->{PROGRAM}->{$name}->{$type} = $shader;
+		&_MergeLexemes;
+	}
+;
+
+%%
+
+sub _Error()
+{
+	if (exists( $_[0]->YYData->{ERRMSG} ))
+	{
+		_Fail( $_[0]->YYData->{ERRMSG} );
+		delete $_[0]->YYData->{ERRMSG};
+		return;
+	};
+	_Fail( "Syntax error at line " . $_[0]->YYData->{LEX}->line() . ".\n" );
+}
+
+my @_keywords =
+(
+	# glue syntax keywords
+	[ 'VERTEXSHADER', 'vertexshader' ],
+	[ 'GEOMETRYSHADER', 'geometryshader' ],
+	[ 'FRAGMENTSHADER', 'fragmentshader' ],
+	[ 'PROGRAM', 'program' ],
+	# keywords and reserved words
+	[ 'ATTRIBUTE', 'attribute' ],
+	[ 'CONST', 'const' ],
+	[ 'UNIFORM', 'uniform' ],
+	[ 'VARYING', 'varying' ],
+	[ 'LAYOUT', 'layout' ],
+	[ 'CENTROID', 'centroid' ],
+	[ 'IF', 'if' ],
+	[ 'ELSE', 'else' ],
+	[ 'FLAT', 'flat' ],
+	[ 'SMOOTH', 'smooth' ],
+	[ 'NOPERSPECTIVE', 'noperspective' ],
+	[ 'SWITCH', 'switch' ],
+	[ 'CASE', 'case' ],
+	[ 'DEFAULT', 'default' ],
+	[ 'BREAK', 'break' ],
+	[ 'CONTINUE', 'continue' ],
+	[ 'DO', 'do' ],
+	[ 'FOR', 'for' ],
+	[ 'WHILE', 'while' ],
+	[ 'IN', 'in' ],
+	[ 'OUT', 'out' ],
+	[ 'INOUT', 'inout' ],
+	[ 'INT', 'int' ],
+	[ 'FLOAT', 'float' ],
+	[ 'VOID', 'void' ],
+	[ 'BOOL', 'bool' ],
+	[ 'INVARIANT', 'invariant' ],
+	[ 'DISCARD', 'discard' ],
+	[ 'RETURN', 'return' ],
+	[ 'MAT2', 'mat2' ],
+	[ 'MAT3', 'mat3' ],
+	[ 'MAT4', 'mat4' ],
+	[ 'MAT2X2', 'mat2x2' ],
+	[ 'MAT2X3', 'mat2x3' ],
+	[ 'MAT2X4', 'mat2x4' ],
+	[ 'MAT3X2', 'mat3x2' ],
+	[ 'MAT3X3', 'mat3x3' ],
+	[ 'MAT3X4', 'mat3x4' ],
+	[ 'MAT4X2', 'mat4x2' ],
+	[ 'MAT4X3', 'mat4x3' ],
+	[ 'MAT4X4', 'mat4x4' ],
+	[ 'VEC2', 'vec2' ],
+	[ 'VEC3', 'vec3' ],
+	[ 'VEC4', 'vec4' ],
+	[ 'UINT', 'uint' ],
+	[ 'LOW_PRECISION', 'lowp' ],
+	[ 'UVEC2', 'uvec2' ],
+	[ 'IVEC2', 'ivec2' ],
+	[ 'IVEC3', 'ivec3' ],
+	[ 'IVEC4', 'ivec4' ],
+	[ 'UVEC4', 'uvec4' ],
+	[ 'PRECISION', 'precision' ],
+	[ 'SAMPLERCUBESHADOW', 'samplerCubeShadow' ],
+	[ 'BVEC2', 'bvec2' ],
+	[ 'BVEC3', 'bvec3' ],
+	[ 'BVEC4', 'bvec4' ],
+	[ 'UVEC3', 'uvec3' ],
+	[ 'MEDIUM_PRECISION', 'mediump' ],
+	[ 'HIGH_PRECISION', 'highp' ],
+	[ 'SAMPLER1D', 'sampler1D' ],
+	[ 'SAMPLER2D', 'sampler2D' ],
+	[ 'SAMPLER3D', 'sampler3D' ],
+	[ 'SAMPLERCUBE', 'samplerCube' ],
+	[ 'SAMPLER1DSHADOW', 'sampler1DShadow' ],
+	[ 'SAMPLER2DSHADOW', 'sampler2DShadow' ],
+	[ 'SAMPLER1DARRAY', 'sampler1DArray' ],
+	[ 'SAMPLER2DARRAY', 'sampler2DArray' ],
+	[ 'SAMPLER1DARRAYSHADOW', 'sampler1DArrayShadow' ],
+	[ 'SAMPLER2DARRAYSHADOW', 'sampler2DArrayShadow' ],
+	[ 'ISAMPLER1D', 'isampler1D' ],
+	[ 'ISAMPLER2D', 'isampler2D' ],
+	[ 'ISAMPLER3D', 'isampler3D' ],
+	[ 'ISAMPLERCUBE', 'isamplerCube' ],
+	[ 'ISAMPLER1DARRAY', 'isampler1DArray' ],
+	[ 'ISAMPLER2DARRAY', 'isampler2DArray' ],
+	[ 'USAMPLER1D', 'usampler1D' ],
+	[ 'USAMPLER2D', 'usampler2D' ],
+	[ 'USAMPLER3D', 'usampler3D' ],
+	[ 'USAMPLERCUBE', 'usamplerCube' ],
+	[ 'USAMPLER1DARRAY', 'usampler1DArray' ],
+	[ 'USAMPLER2DARRAY', 'usampler2DArray' ],
+	[ 'SAMPLER2DRECT', 'sampler2DRect' ],
+	[ 'SAMPLERBUFFER', 'samplerBuffer' ],
+	[ 'SAMPLER2DMS', 'sampler2DMS' ],
+	[ 'STRUCT', 'struct' ],
+	[ 'COMMON', 'common' ],
+	[ 'PARTITION', 'partition' ],
+	[ 'ASM', 'asm' ],
+	[ 'CLASS', 'class' ],
+	[ 'GOTO', 'goto' ],
+	[ 'INLINE', 'inline' ],
+	[ 'LONG', 'long' ],
+	[ 'INPUT', 'input' ],
+	[ 'HVEC2', 'hvec2' ],
+	[ 'FILTER', 'filter' ],
+	[ 'IMAGE1D', 'image1D' ],
+	[ 'IMAGE2D', 'image2D' ],
+	[ 'IMAGE3D', 'image3D' ],
+	[ 'IMAGECUBE', 'imageCube' ],
+	[ 'IIMAGE1D', 'iimage1D' ],
+	[ 'IIMAGE2D', 'iimage2D' ],
+	[ 'IIMAGE3D', 'iimage3D' ],
+	[ 'IIMAGECUBE', 'iimageCube' ],
+	[ 'UIMAGE1D', 'uimage1D' ],
+	[ 'UIMAGE2D', 'uimage2D' ],
+	[ 'UIMAGE3D', 'uimage3D' ],
+	[ 'UIMAGECUBE', 'uimageCube' ],
+	[ 'IMAGE1DARRAY', 'image1DArray' ],
+	[ 'IIMAGE1DARRAY', 'iimage1DArray' ],
+	[ 'IMAGE2DARRAY', 'image2DArray' ],
+	[ 'IIMAGE2DARRAY', 'iimage2DArray' ],
+	[ 'UIMAGE1DARRAY', 'uimage1DArray' ],
+	[ 'UIMAGE2DARRAY', 'uimage2DArray' ],
+	[ 'NOINLINE', 'noinline' ],
+	[ 'SHORT', 'short' ],
+	[ 'HVEC3', 'hvec3' ],
+	[ 'OUTPUT', 'output' ],
+	[ 'HVEC4', 'hvec4' ],
+	[ 'DVEC2', 'dvec2' ],
+	[ 'DVEC3', 'dvec3' ],
+	[ 'DVEC4', 'dvec4' ],
+	[ 'FVEC2', 'fvec2' ],
+	[ 'FVEC3', 'fvec3' ],
+	[ 'FVEC4', 'fvec4' ],
+	[ 'VOLATILE', 'volatile' ],
+	[ 'HALF', 'half' ],
+	[ 'PUBLIC', 'public' ],
+	[ 'FIXED', 'fixed' ],
+	[ 'STATIC', 'static' ],
+	[ 'EXTERN', 'extern' ],
+	[ 'EXTERNAL', 'external' ],
+	[ 'INTERFACE', 'interface' ],
+	[ 'DOUBLE', 'double' ],
+	[ 'UNSIGNED', 'unsigned' ],
+	[ 'SUPERP', 'superp' ],
+	[ 'UNION', 'union' ],
+	[ 'ENUM', 'enum' ],
+	[ 'TYPEDEF', 'typedef' ],
+	[ 'TEMPLATE', 'template' ],
+	[ 'THIS', 'this' ],
+	[ 'PACKED', 'packed' ],
+	[ 'ACTIVE', 'active' ],
+	[ 'SAMPLER2DRECTSHADOW', 'sampler2DRectShadow' ],
+	[ 'ISAMPLERBUFFER', 'isamplerBuffer' ],
+	[ 'ISAMPLER2DMS', 'isampler2DMS' ],
+	[ 'ISAMPLER2DRECT', 'isampler2DRect' ],
+	[ 'USAMPLER2DRECT', 'usampler2DRect' ],
+	[ 'USAMPLERBUFFER', 'usamplerBuffer' ],
+	[ 'USAMPLER2DMS', 'usampler2DMS' ],
+	[ 'USAMPLER2DMSARRAY', 'usampler2DMSArray' ],
+	[ 'SAMPLER2DMSARRAY', 'sampler2DMSArray' ],
+	[ 'ISAMPLER2DMSARRAY', 'isampler2DMSArray' ],
+	[ 'SAMPLER3DRECT', 'sampler3DRect' ],
+	[ 'IMAGE1DSHADOW', 'image1DShadow' ],
+	[ 'IMAGE2DSHADOW', 'image2DShadow' ],
+	[ 'IMAGE1DARRAYSHADOW', 'image1DArrayShadow' ],
+	[ 'IMAGEBUFFER', 'imageBuffer' ],
+	[ 'SIZEOF', 'sizeof' ],
+	[ 'CAST', 'cast' ],
+	[ 'USING', 'using' ],
+	[ 'NAMESPACE', 'namespace' ],
+	[ 'ROW_MAJOR', 'row_major' ],
+	[ 'IMAGE2DARRAYSHADOW', 'image2DArrayShadow' ],
+	[ 'UIMAGEBUFFER', 'uimageBuffer' ],
+	[ 'IIMAGEBUFFER', 'iimageBuffer' ]
+);
+
+my @_punctuation =
+(
+	[ 'LEFT_ASSIGN', '<<=' ],
+	[ 'RIGHT_ASSIGN', '>>=' ],
+	[ 'MUL_ASSIGN', '*=' ],
+	[ 'DIV_ASSIGN', '/=' ],
+	[ 'ADD_ASSIGN', '+=' ],
+	[ 'MOD_ASSIGN', '%=' ],
+	[ 'AND_ASSIGN', '&=' ],
+	[ 'XOR_ASSIGN', '^=' ],
+	[ 'OR_ASSIGN', '|=' ],
+	[ 'SUB_ASSIGN', '-=' ],
+	[ 'LEFT_OP', '<<' ],
+	[ 'RIGHT_OP', '>>' ],
+	[ 'INC_OP', '++' ],
+	[ 'DEC_OP', '--' ],
+	[ 'LE_OP', '<=' ],
+	[ 'GE_OP', '>=' ],
+	[ 'EQ_OP', '==' ],
+	[ 'NE_OP', '!=' ],
+	[ 'AND_OP', '&&' ],
+	[ 'OR_OP', '||' ],
+	[ 'XOR_OP', '^^' ],
+	[ 'LEFT_PAREN', '(' ],
+	[ 'RIGHT_PAREN', ')' ],
+	[ 'LEFT_BRACKET', '[' ],
+	[ 'RIGHT_BRACKET', ']' ],
+	[ 'LEFT_BRACE', '{' ],
+	[ 'RIGHT_BRACE', '}' ],
+	[ 'DOT', '.' ],
+	[ 'COMMA', ',' ],
+	[ 'COLON', ':' ],
+	[ 'EQUAL', '=' ],
+	[ 'SEMICOLON', ';' ],
+	[ 'BANG', '!' ],
+	[ 'DASH', '-' ],
+	[ 'TILDE', '~' ],
+	[ 'PLUS', '+' ],
+	[ 'STAR', '*' ],
+	[ 'SLASH', '/' ],
+	[ 'PERCENT', '%' ],
+	[ 'LEFT_ANGLE', '<' ],
+	[ 'RIGHT_ANGLE', '>' ],
+	[ 'VERTICAL_BAR', '|' ],
+	[ 'CARET', '^' ],
+	[ 'AMPERSAND', '&' ],
+	[ 'QUESTION', '?' ]
+);
+
+my %_keyword_name = ();
+
+sub _Lexer($)
+{
+	my $sp = shift;
+	my $tok;
+	my $incomment = undef;
+
+	do {
+		# remember the start of the lookahead token
+		$sp->YYData->{PRIOR_OFFSET} = $sp->YYData->{LEX}->offset();
+		$sp->YYData->{PRIOR_LINE} = $sp->YYData->{LEX}->line();
+
+		# get the next token
+		$tok = $sp->YYData->{LEX}->next();
+
+		if (!$incomment)
+		{
+			$incomment = 1 if ($tok->name() =~ /MLCOMMENTSTART/);
+		}
+		else
+		{
+			$incomment = undef if ($tok->name() =~ /MLCOMMENTEND/);
+		}
+		if (!$incomment && ($tok->name() =~ /(PREPROCESSOR|COMMENT|NEWLINE)/))
+		{
+			$sp->YYData->{LEX}->line( $sp->YYData->{LEX}->line() + 1 );
+		}
+	} while ($incomment || ($tok->name() =~ /(PREPROCESSOR|COMMENT|MLCOMMENTSTART|MLCOMMENTEND|NEWLINE)/)) ;
+
+	my $name = $tok->name();
+	my $text = $tok->text();
+	if ($name =~ /(IDENTIFIER|PUNCTUATION)/)
+	{
+		$name = $_keyword_name{$tok->text()} if (exists( $_keyword_name{$tok->text()} )) ;
+	}
+	#_Dbug( "Parsed $name ($text)\n" );
+	my $lexeme =
+	{
+		'TEXT' => $text,
+		'POS' => [ $sp->YYData->{PRIOR_OFFSET}, $sp->YYData->{LEX}->offset() ],
+		'LINE' => [ $sp->YYData->{PRIOR_LINE}, $sp->YYData->{LEX}->line() ]
+	};
+	return( $name, $lexeme );
+}
+
+sub Parse($$)
+{
+	my $self = shift;
+	my $file = shift;
+	my $debug = shift;
+
+	local *FILE;
+
+	die "Unable to read $file" if (!open( FILE, "<$file" )) ;
+	# slurp in the whole file so we can get substrings by offset
+	my $lines = undef;
+	read( FILE, $lines, 1<<31 );
+	close( FILE );
+
+	my $keywords = '(' . join( '|', map { quotemeta( @{$_}[1] ) } @_keywords ) . ')';
+	my $punctuation = '(' . join( '|', map { quotemeta( @{$_}[1] ) } @_punctuation ) . ')';
+	map { $_keyword_name{@{$_}[1]} = @{$_}[0] } @_keywords;
+	map { $_keyword_name{@{$_}[1]} = @{$_}[0] } @_punctuation;
+	#print "keywords = $keywords\n";
+	#print "keyword names = " . join( ", ", sort(values(%_keyword_name)) ), "\n";
+
+	my @tokens =
+	(
+		'NEWLINE',			'\n',
+		'COMMENT',			'\/\/.*\n',
+		'MLCOMMENTSTART',	'\/\*',
+		'MLCOMMENTEND',		'\*\/',
+		'PREPROCESSOR',		'#.*\n',
+		'IDENTIFIER',  		'[a-zA-Z_][a-zA-Z_0-9]*',
+		'PUNCTUATION',		$punctuation,
+		'FLOATCONSTANT',	'([0-9]*\.[0-9]*([eE][+-]?[0-9]+)?|([0-9]+(\.[0-9]*)?|[0-9]*\.[0-9]*)([eE][+-]?[0-9]+))[fF]?',
+		'UINTCONSTANT',		'(0[0-7]+|0[xX][0-9a-fA-F]+|[1-9][0-9]*)[uU]',
+		'INTCONSTANT',		'(0[0-7]*|0[xX][0-9a-fA-F]+|[1-9][0-9]*)',
+		'BOOLCONSTANT',		'(true|false)',
+	);
+
+	$self->YYData->{LEX} = Parse::Lex->new( @tokens );
+	$self->YYData->{LINES} = $lines;
+	$self->YYData->{FILE} = $file;
+	$self->YYData->{GLOBAL_DECLS} = '';
+	$self->YYData->{PRIOR_OFFSET} = 0;
+	$self->YYData->{LEX}->from( $lines );
+	# we have to track line numbers ourselves
+	$self->YYData->{LEX}->line( 1 );
+	$self->YYData->{MARK_OFFSET} = 0;
+	$self->YYData->{MARK_LINE} = 1;
+	# where decls are parsed from
+	$self->YYData->{DECL_SCOPE} = '';
+	$self->YYData->{DECLS}->{$self->YYData->{DECL_SCOPE}} = {};
+
+	$self->YYParse( 'yylex' => \&_Lexer, 'yyerror' => \&_Error, 'yydebug' => $debug );
+}
+
+##
+## PrintTree - show the nodes from the syntax tree
+##
+
+sub PrintTree($$)
+{
+	my $lexeme = shift;
+	my $indent = shift;
+	#print "\ngot >$lexeme< (", join( ",", keys( %{$lexeme} ) ), ")\n";
+	print $lexeme->{TEXT};
+	if (exists( $lexeme->{CHILD} ))
+	{
+		my $c = $lexeme->{CHILD};
+		my $newindent = "$indent  ";
+		print "(\n$newindent";
+		PrintTree( $c->[0], $newindent );
+		for (my $i = 1; $i <= $#{$c}; ++$i)
+		{
+			print ",\n$newindent";
+			PrintTree( $c->[$i], $newindent );
+		}
+		print "\n$indent)";
+	}
+}
+
+##
+## Build - expand the specification into it's fully-realized form
+##
+
+sub Build($)
+{
+	my $self = shift;
+	my $file = $self->YYData->{FILE};
+
+	#_Info( "Tree:\n" );	PrintTree( $self->YYData->{TREE}, "" );
+
+	print
+		"//\n",
+		"// glueglsl shaders generated from $file, do no edit\n",
+		"//\n",
+		"\n",
+		"#if !defined(__glslglue_h)\n",
+		"    #include \"glslglue.h\"\n",
+		"#endif\n",
+		"\n";
+
+	print "namespace glsl {\n\n";
+
+	foreach my $type ('vertexshader', 'geometryshader', 'fragmentshader')
+	{
+		#print "$type: ", join( ", ", keys( %{$self->YYData->{$type}} ) ), "\n\n";
+		foreach my $name (keys( %{$self->YYData->{$type}} ))
+		{
+			my $sref = $self->YYData->{$type}->{$name};
+			print "class shader_$name: public $type\n{\npublic:\n";
+			print "\tconst char *name() const { return \"$name\"; }\n";
+			print "\tshader_$name() : $type(\n\"", $sref->{TEXT}, "\\n\"\n\t) {}\n";
+			print "};\n\n";
+		}
+	}
+
+	foreach my $name (keys( %{$self->YYData->{PROGRAM}} ))
+	{
+		my $prog = $self->YYData->{PROGRAM}->{$name};
+		print "class $name: public program\n{\n";
+		print "public:\n";
+		print "\tconst char *name() const { return \"$name\"; }\n";
+		my %members = ();
+		foreach my $type ('vertexshader', 'geometryshader', 'fragmentshader')
+		{
+			if (exists( $prog->{$type} ))
+			{
+				my $shader = $prog->{$type};
+				my $sref = $self->YYData->{$type}->{$shader};
+				#print "Checking $type $shader\n";
+				print "\tshader_$shader $shader;\n";
+				foreach my $decl (keys( %{$sref->{DECLS}} ))
+				{
+					my $dref = $sref->{DECLS}->{$decl};
+					my $qual = $dref->{QUAL};
+					my $dtype = $dref->{TYPE};
+					my $asize = $dref->{ASIZE};
+					$dtype = "sampler" if ($dtype =~ /^sampler/) ;
+					$dtype .= "_array" if (defined( $asize )) ;
+
+					#print "\t// $qual $dtype $decl ", defined( $asize ) ? "[$asize]" : "", "\n";
+					my $memtype = undef;
+					if (($type eq 'vertexshader') && ($qual =~ /^(attribute|in)$/))
+					{
+						$memtype = "in_$dtype";
+					}
+					elsif ($qual eq 'uniform')
+					{
+						$memtype = "uniform_$dtype";
+					}
+					if (defined( $memtype ))
+					{
+						if (exists( $members{$decl} ))
+						{
+							if ($members{$decl}->{MEMTYPE} != $memtype)
+							{
+								_Warn( "Declaration conflict for $decl in program $name\n" );
+							}
+						}
+						else
+						{
+							$members{$decl} =
+							{
+								'MEMTYPE' => $memtype,
+								'ASIZE' => $asize
+							};
+						}
+					}
+				}
+			}
+		}
+		# in/uniform variables
+		foreach my $decl (sort( keys( %members ) ))
+		{
+			my $asize = $members{$decl}->{ASIZE};
+			my $memtype = $members{$decl}->{MEMTYPE};
+			print "\t$memtype $decl", (($asize > 0) ? "[$asize]" : ""), ";\n";
+		}
+
+		# constructor
+		print "\t$name():\n\t\tprogram()";
+		foreach my $decl (sort( keys( %members ) ))
+		{
+			my $asize = $members{$decl}->{ASIZE};
+			print ",\n\t\t$decl( \"$decl\" )" if ($asize <= 0) ;
+		}
+		print "\n\t{\n";
+		foreach my $decl (sort( keys( %members ) ))
+		{
+			my $asize = $members{$decl}->{ASIZE};
+			if ($asize > 0)
+			{
+				my $memtype = $members{$decl}->{MEMTYPE};
+				for (my $i = 0; $i < $asize; ++$i)
+				{
+					print "\t\tnew (\&$decl\[$i\]) $memtype( \"$decl\[$i\]\" );\n";
+				}
+			}
+		}
+		print "\t}\n";
+
+		# attach
+		print "\tvirtual bool compile( char *errlog, GLsizei *len )\n\t{\n";
+		foreach my $type ('vertexshader', 'geometryshader', 'fragmentshader')
+		{
+			if (exists( $prog->{$type} ))
+			{
+				my $shader = $prog->{$type};
+				print "\t\tif (!$shader.compile( errlog, len )) return( false );\n";
+				print "\t\tglAttachShader( handle(), $shader.handle() );\n";
+			}
+		}
+		print "\t\treturn( true );\n\t}\n";
+
+		# bind
+		print "\tvirtual bool init( char *errlog, GLsizei *len )\n\t{\n";
+		foreach my $decl (sort( keys( %members ) ))
+		{
+			my $getter = ($members{$decl}->{MEMTYPE} =~ /^uniform/) ? 'glGetUniformLocation' : 'glGetAttribLocation';
+			my $asize = $members{$decl}->{ASIZE};
+			if ($asize > 0)
+			{
+				print "\t\tfor (int _ = 0; _ < $asize; ++_)\n\t\t{\n";
+				print "\t\t\tif (!$decl\[_\].init( $getter( handle(), $decl\[_\].name() ) ))\n\t\t\t{\n";
+				print "\t\t\t\t*len = snprintf( errlog, *len, \"Error binding %s in $name, 0x%x\", $decl\[_\].name(), glGetError() );\n";
+				print "\t\t\t\treturn( false );\n\t\t\t}\n";
+				print "\t\t}\n";
+			}
+			else
+			{
+				print "\t\tif (!$decl.init( $getter( handle(), $decl.name() ) ))\n\t\t{\n";
+				print "\t\t\t*len = snprintf( errlog, *len, \"Error binding %s in $name, 0x%x\", $decl.name(), glGetError() );\n";
+				print "\t\t\treturn( false );\n\t\t}\n";
+			}
+		}
+		print "\t\treturn( true );\n\t}\n";
+
+		print "};\n\n";
+	}
+
+	print "} // namespace glsl\n";
+}
